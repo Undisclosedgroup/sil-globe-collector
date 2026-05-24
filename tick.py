@@ -72,7 +72,12 @@ def _collect_layer_specs():
     return [s for s in specs if s.get("id") != "boats"]
 
 
-_LAYER_TIMEOUT_S = 120  # default; cctv/power_plants/hospitals get 300s below
+_LAYER_TIMEOUT_DEFAULT = 120
+_LAYER_TIMEOUT_OVERRIDES = {
+    "cctv": 300,         # 17 sub-networks, each with proxy rotation
+    "power_plants": 300, # Overpass nuclear/coal/gas query is heavy
+    "hospitals": 300,    # same — large Overpass element set
+}
 _LAYER_SEM = asyncio.Semaphore(8)  # cap concurrent layers — GH runner + Webshare pool sanity
 
 
