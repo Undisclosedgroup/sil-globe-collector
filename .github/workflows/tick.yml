@@ -10,7 +10,7 @@
 name: tick
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '15,45 * * * *'
   workflow_dispatch:        # manual "Run workflow" button
 
 # Don't pile up runs if a previous tick is still going.
@@ -21,7 +21,7 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 18       # well under the 5-min cron interval after build
+    timeout-minutes: 25       # well under the 5-min cron interval after build
     steps:
       - uses: actions/checkout@v4
 

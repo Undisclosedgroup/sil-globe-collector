@@ -74,9 +74,9 @@ def _collect_layer_specs():
 
 _LAYER_TIMEOUT_DEFAULT = 120
 _LAYER_TIMEOUT_OVERRIDES = {
-    "cctv": 500,         # 17 sub-networks × proxy rotation; 300s wasn't enough on Webshare
+    "cctv": 900,         # 17 sub-networks SEQUENTIAL × proxy rotation; ~13 min observed
     "power_plants": 300, # Overpass nuclear/coal/gas — passes at 300s
-    "hospitals": 500,    # 217k OSM elements — server computes 60-180s before bytes flow
+    "hospitals": 700,    # 120k OSM elements — Overpass takes 60-180s server-side
 }
 _LAYER_SEM = asyncio.Semaphore(8)  # cap concurrent layers — GH runner + Webshare pool sanity
 
