@@ -72,15 +72,27 @@ def _collect_layer_specs():
     return [s for s in specs if s.get("id") != "boats"]
 
 
+_LAYER_TIMEOUT_S = 120
+_LAYER_SEM = asyncio.Semaphore(8)  # cap concurrent layers — GH runner + Webshare pool sanity
+
+
 async def _tick_layer(spec):
-    """Fetch one layer + write blob. Returns (id, count, error|None)."""
+    """Fetch one layer + write blob. Returns (id, count, error|None).
+
+    Wrapped in a semaphore (max 8 concurrent layers) so we don't fork 45
+    parallel proxy sessions and saturate the Webshare pool, and in a
+    wait_for(_LAYER_TIMEOUT_S) so a single slow upstream can't blow the
+    whole tick past the workflow timeout."""
     lid = spec["id"]
     fetch = spec["fetch"]
     t0 = time.monotonic()
-    try:
-        payload = await fetch()
-    except Exception as e:
-        return lid, None, f"{type(e).__name__}: {e}"
+    async with _LAYER_SEM:
+        try:
+            payload = await asyncio.wait_for(fetch(), timeout=_LAYER_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return lid, None, f"timeout after {_LAYER_TIMEOUT_S}s"
+        except Exception as e:
+            return lid, None, f"{type(e).__name__}: {e}"
 
     count = payload.get("count", 0) if isinstance(payload, dict) else 0
     # Same safety rule as the daemon: don't overwrite a previously-good
