@@ -560,11 +560,125 @@ _POWER_SRC_LABEL = {
     "energy_storage": "Battery", "waste": "Waste",
 }
 
+# Canonical fuel buckets used in the merged output. Sources (OSM tags, WRI
+# `primary_fuel`, EIA Energy Source 1) feed in via _fuel_canonical().
+_POWER_FUEL_COLOR = {
+    "Nuclear":      "#7C4DFF",  # purple
+    "Coal":         "#424242",  # dark grey
+    "Natural Gas":  "#FF9800",  # orange
+    "Oil":          "#5D4037",  # brown
+    "Wind":         "#03A9F4",  # light blue
+    "Solar":        "#FDD835",  # yellow
+    "Hydro":        "#1E88E5",  # blue
+    "Biomass":      "#8BC34A",  # green
+    "Geothermal":   "#E64A19",  # red-orange
+    "Battery":      "#9E9E9E",  # grey
+    "Waste":        "#795548",  # brown
+    "Other":        "#F5A623",  # amber (legacy power_plant color)
+}
+
+# Map raw fuel strings from various sources to canonical buckets.
+_FUEL_NORMALIZE = {
+    # OSM plant:source already maps via _POWER_SRC_LABEL
+    # WRI primary_fuel values:
+    "nuclear": "Nuclear",
+    "coal": "Coal", "petcoke": "Coal", "lignite": "Coal",
+    "gas": "Natural Gas", "natural_gas": "Natural Gas", "cogeneration": "Natural Gas",
+    "oil": "Oil", "petroleum": "Oil", "diesel": "Oil",
+    "wind": "Wind",
+    "solar": "Solar", "photovoltaic": "Solar",
+    "hydro": "Hydro", "water": "Hydro", "tidal": "Hydro", "wave_and_tidal": "Hydro",
+    "biomass": "Biomass", "biogas": "Biomass",
+    "geothermal": "Geothermal",
+    "storage": "Battery", "battery": "Battery", "energy_storage": "Battery",
+    "waste": "Waste",
+    # EIA Energy Source 1 codes (subset; see EIA-923/860 instructions):
+    "nuc": "Nuclear",
+    "bit": "Coal", "sub": "Coal", "lig": "Coal", "ant": "Coal", "rc": "Coal",
+    "wc": "Coal", "sgc": "Coal",
+    "ng": "Natural Gas", "lfg": "Natural Gas", "obg": "Natural Gas",
+    "pg": "Natural Gas", "bfg": "Natural Gas", "og": "Natural Gas",
+    "dfo": "Oil", "rfo": "Oil", "wo": "Oil", "kero": "Oil", "jf": "Oil",
+    "pc": "Coal", "sgp": "Oil",
+    "wnd": "Wind",
+    "sun": "Solar",
+    "wat": "Hydro", "mwh": "Hydro",  # MWh = pumped storage hydro
+    "wds": "Biomass", "wdl": "Biomass", "ab": "Biomass", "msw": "Biomass",
+    "obs": "Biomass", "obl": "Biomass", "slw": "Biomass",
+    "geo": "Geothermal",
+    "msb": "Waste", "msn": "Waste", "tdf": "Waste",
+}
+
+
+def _fuel_canonical(raw: str | None) -> str:
+    if not raw:
+        return "Other"
+    s = str(raw).strip().lower().split(";")[0].split(",")[0].strip()
+    if not s:
+        return "Other"
+    # Try OSM-style label first (already canonical capitalization)
+    if s in _POWER_SRC_LABEL:
+        return _POWER_SRC_LABEL[s]
+    if s in _FUEL_NORMALIZE:
+        return _FUEL_NORMALIZE[s]
+    # Title-cased pass for unknowns that already look like our buckets
+    title = s.title()
+    if title in _POWER_FUEL_COLOR:
+        return title
+    return "Other"
+
+
+def _color_by_fuel(fuel: str) -> str:
+    return _POWER_FUEL_COLOR.get(fuel, _POWER_FUEL_COLOR["Other"])
+
+
+def _pp_dedup_key(lat: float, lng: float, operator: str | None) -> tuple:
+    """Key for collapsing duplicate plants across sources.
+
+    ~110m precision via 3-decimal rounding + first-20-char lowercased operator
+    name. Operator is often missing/inconsistent, so when blank we fall back
+    to a geo-only key — that does collapse co-located plants from the same
+    multi-unit campus into one row, which is desired for this layer.
+    """
+    try:
+        lat_r = round(float(lat), 3)
+        lng_r = round(float(lng), 3)
+    except (TypeError, ValueError):
+        return ("__bad__", lat, lng)
+    op = (operator or "").strip().lower()[:20]
+    return (lat_r, lng_r, op)
+
+
 POWER_PLANTS_CLAUSE = (
     'node["power"="plant"]({s},{w},{n},{e});'
     'way["power"="plant"]({s},{w},{n},{e});'
     'relation["power"="plant"]({s},{w},{n},{e});'
 )
+
+
+def _output_to_mw(s: str | None) -> float | None:
+    """Parse OSM plant:output:electricity values into MW.
+
+    Common forms: '12 MW', '1.5 GW', '500 kW', 'yes', or a bare number (assumed MW).
+    """
+    if not s:
+        return None
+    txt = str(s).strip().lower().replace(",", "")
+    if txt in ("yes", "no", ""):
+        return None
+    mult = 1.0  # MW default
+    for unit, m in (("gw", 1000.0), ("mw", 1.0), ("kw", 0.001), ("w", 1e-6)):
+        if txt.endswith(unit):
+            txt = txt[: -len(unit)].strip()
+            mult = m
+            break
+    try:
+        v = float(txt.split()[0]) if txt else None
+    except (ValueError, IndexError):
+        return None
+    if v is None:
+        return None
+    return round(v * mult, 3)
 
 
 def _normalize_power(raw):
@@ -578,17 +692,108 @@ def _normalize_power(raw):
         if lat is None or lng is None:
             continue
         src = (tags.get("plant:source") or "").lower().split(";")[0]
+        fuel = _fuel_canonical(src)
+        capacity_mw = _output_to_mw(tags.get("plant:output:electricity"))
+        start_date = tags.get("start_date") or tags.get("opening_date")
+        commissioning_year = None
+        if start_date:
+            try:
+                commissioning_year = int(str(start_date)[:4])
+            except ValueError:
+                commissioning_year = None
         items.append({
-            "id": f"{el.get('type')}-{el.get('id')}",
+            "id": f"osm-{el.get('type')}-{el.get('id')}",
             "lat": lat, "lng": lng,
             "label": tags.get("name") or _POWER_SRC_LABEL.get(src, "Power Plant"),
-            "category": _POWER_SRC_LABEL.get(src, "Other"),
+            "category": fuel,
+            "primary_fuel": fuel,
             "source_type": src or None,
             "output": tags.get("plant:output:electricity"),
+            "capacity_mw": capacity_mw,
             "operator": tags.get("operator"),
             "country": tags.get("addr:country") or tags.get("country"),
-            "color": "#F5A623",
+            "commissioning_year": commissioning_year,
+            "color": _color_by_fuel(fuel),
+            "sources": ["osm"],
         })
+    return items
+
+
+# ============================================================================
+# Power plants — WRI Global Power Plant Database v1.3 (CC BY 4.0)
+# ----------------------------------------------------------------------------
+# ~30k plants worldwide, hand-curated. Provides capacity_mw, primary_fuel,
+# owner, commissioning_year — the fields OSM consistently lacks. Fetched
+# from the wri-dataportal-prod S3 bucket (CSV inside a zip). The dataset has
+# not been refreshed since 2021 but the inventory is still the best public
+# global baseline.
+# ============================================================================
+WRI_PP_URL = (
+    "https://wri-dataportal-prod.s3.amazonaws.com/manual/"
+    "global_power_plant_database_v_1_3.zip"
+)
+
+
+async def _pp_wri():
+    """Fetch + parse WRI Global Power Plant Database. Returns normalized items."""
+    import zipfile
+
+    try:
+        r = await _F.aget(WRI_PP_URL, headers={"Accept": "application/zip"},
+                          timeout=90)
+        if r.status != 200 or not r.body:
+            print(f"power_plants: wri http={r.status} bytes={len(r.body or b'')}")
+            return []
+        zf = zipfile.ZipFile(io.BytesIO(r.body))
+    except Exception as e:
+        print(f"power_plants: wri fetch FAIL {type(e).__name__}: {e}")
+        return []
+    # Find the CSV inside the zip (single top-level CSV expected).
+    csv_name = None
+    for n in zf.namelist():
+        if n.lower().endswith(".csv") and "global_power_plant_database" in n.lower():
+            csv_name = n
+            break
+    if not csv_name:
+        print(f"power_plants: wri zip missing csv (members={zf.namelist()[:5]})")
+        return []
+    try:
+        with zf.open(csv_name) as fh:
+            text = io.TextIOWrapper(fh, encoding="utf-8", errors="replace")
+            reader = csv.DictReader(text)
+            items = []
+            for row in reader:
+                try:
+                    lat = float(row.get("latitude") or "")
+                    lng = float(row.get("longitude") or "")
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    cap = float(row["capacity_mw"]) if row.get("capacity_mw") else None
+                except (TypeError, ValueError):
+                    cap = None
+                try:
+                    year = int(float(row["commissioning_year"])) if row.get("commissioning_year") else None
+                except (TypeError, ValueError):
+                    year = None
+                fuel = _fuel_canonical(row.get("primary_fuel"))
+                items.append({
+                    "id": f"wri-{(row.get('gppd_idnr') or '').strip() or len(items)}",
+                    "lat": lat, "lng": lng,
+                    "label": (row.get("name") or "").strip() or "Power Plant",
+                    "category": fuel,
+                    "primary_fuel": fuel,
+                    "capacity_mw": cap,
+                    "operator": (row.get("owner") or "").strip() or None,
+                    "country": (row.get("country_long") or row.get("country") or "").strip() or None,
+                    "commissioning_year": year,
+                    "color": _color_by_fuel(fuel),
+                    "sources": ["wri"],
+                })
+    except Exception as e:
+        print(f"power_plants: wri parse FAIL {type(e).__name__}: {e}")
+        return []
+    print(f"power_plants: wri -> {len(items)} plants")
     return items
 
 
