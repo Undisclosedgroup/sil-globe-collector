@@ -1,0 +1,68 @@
+# Boats AISStream daemon — long-running WebSocket listener.
+#
+# AISStream's only access pattern is a persistent WebSocket; there's no REST
+# snapshot. Each job here connects to the WS, accumulates per-MMSI vessel
+# state, and writes `globe/boats.json` to Vercel Blob every 30s. After
+# 5h 50m the boats_daemon's watchdog cancels cleanly, the workflow ends,
+# and the bottom of this file chains the next run via repository_dispatch.
+#
+# Net effect: ~continuous coverage with ~10-min gaps between job handoffs
+# (vs needing a $5/mo Fly.io VM). Public repo => free unlimited minutes.
+
+name: boats
+on:
+  schedule:
+    # Backup trigger every 6h in case the chain breaks (e.g. runner killed
+    # before posting the dispatch). Worst case gap ~6h.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [boats-chain]
+
+concurrency:
+  # Never run two boats daemons simultaneously — they'd both write the
+  # same blob and double-burn AISStream's per-key rate budget.
+  group: boats-daemon
+  cancel-in-progress: false
+
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # 5h 55m — under GitHub's 6h job ceiling
+    permissions:
+      # repository_dispatch needs write access to chain ourselves.
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python deps
+        # boats only needs websockets + certifi + curl_cffi (for blob_put).
+        # Skip the heavy shapely/pyproj/lxml that tick.py needs.
+        run: |
+          pip install --no-cache-dir \
+            "websockets>=12.0" "certifi>=2024.2.2" "curl_cffi>=0.6" \
+            "requests>=2.32"
+
+      - name: Run boats daemon (5h 50m, then exit)
+        env:
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: python -u boats_daemon.py
+
+      - name: Chain next run
+        # Even if the daemon exits non-zero (rare), still chain — better
+        # one gap than indefinite downtime. always() runs on any outcome.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api -X POST "repos/$REPO/dispatches" \
+            -f event_type=boats-chain \
+            && echo "  chained next boats run via repository_dispatch"
