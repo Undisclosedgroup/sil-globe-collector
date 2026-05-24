@@ -358,59 +358,54 @@ async def fetch_submarine_cables():
 
 
 # ============================================================================
-# Holocene volcanoes (Smithsonian GVP — paginated)
+# Volcanoes — OSM Overpass natural=volcano
+# ----------------------------------------------------------------------------
+# 2026-05-24: Smithsonian GVP WFS started returning a Java ServiceException
+# on every request (their server bug, not ours). Swapped to OSM Overpass
+# which is the same source the collector already uses for nuclear /
+# military_bases / power_plants and reliably returns 200 from both proxy
+# providers. ~10k volcano nodes globally; ~5k are named. We tag each with
+# the volcano type and last eruption when OSM has those keys (about half do).
 # ============================================================================
-HOLOCENE_URL = (
-    "https://webservices.volcano.si.edu/geoserver/GVP-VOTW/wfs"
-    "?service=WFS&version=1.0.0&request=GetFeature"
-    "&typeName=GVP-VOTW:Smithsonian_VOTW_Holocene_Volcanoes"
-    "&outputFormat=application%2Fjson&maxFeatures=200&startIndex={offset}"
+VOLCANO_OVERPASS_QL = (
+    '[out:json][timeout:90];'
+    'node["natural"="volcano"];'
+    'out;'
 )
 
 
 async def fetch_volcanoes():
+    import urllib.parse
+    url = ("https://overpass-api.de/api/interpreter?data="
+           + urllib.parse.quote(VOLCANO_OVERPASS_QL))
+    try:
+        data = await _aget_json(
+            url,
+            headers={"User-Agent": "globe-recon/1.0",
+                     "Accept": "application/json"},
+            timeout=120, tries=2)
+    except Exception:
+        return _payload("volcanoes", [])
     items = []
-    seen = set()
-    for offset in range(0, 2000, 200):
-        try:
-            url = HOLOCENE_URL.format(offset=offset)
-            data = await _aget_json(url, headers={"Accept": "application/json"},
-                                    timeout=20, tries=1)
-        except Exception:
+    for el in data.get("elements", []):
+        lat, lng = el.get("lat"), el.get("lon")
+        if lat is None or lng is None:
             continue
-        feats = data.get("features") or []
-        if not feats:
-            break
-        for feat in feats:
-            geom = feat.get("geometry") or {}
-            if geom.get("type") != "Point":
-                continue
-            coords = geom.get("coordinates") or []
-            if len(coords) < 2:
-                continue
-            lng, lat = coords[0], coords[1]
-            props = feat.get("properties") or {}
-            name = (props.get("VolcanoName") or props.get("volcanoname")
-                    or props.get("Volcano_Name"))
-            vnum = (props.get("VolcanoNumber") or props.get("volcanonumber")
-                    or props.get("Volcano_Number"))
-            if vnum in seen:
-                continue
-            seen.add(vnum)
-            items.append({
-                "id": f"gvp-{vnum or len(items)}",
-                "lat": lat, "lng": lng,
-                "label": name or "Volcano",
-                "country": props.get("Country") or props.get("country"),
-                "primary_type": (props.get("PrimaryVolcanoType")
-                                 or props.get("primaryvolcanotype")),
-                "last_known_eruption": (props.get("LastKnownEruption")
-                                        or props.get("lastknowneruption")),
-                "category": "Holocene volcano",
-                "color": "#FF6F00",
-            })
-        if len(feats) < 200:
-            break
+        tags = el.get("tags") or {}
+        name = tags.get("name") or tags.get("name:en")
+        items.append({
+            "id": f"osm-volcano-{el.get('id')}",
+            "lat": lat, "lng": lng,
+            "label": name or "Volcano",
+            "country": tags.get("addr:country") or tags.get("is_in:country"),
+            "primary_type": tags.get("volcano:type"),
+            "last_known_eruption": tags.get("volcano:last_eruption"),
+            "status": tags.get("volcano:status"),
+            "elevation_m": tags.get("ele"),
+            "wikipedia": tags.get("wikipedia"),
+            "category": "Volcano",
+            "color": "#FF6F00",
+        })
     return _payload("volcanoes", items)
 
 
