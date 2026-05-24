@@ -1,0 +1,24 @@
+name: probe-proxy
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test ProxyRack reachability from GH runner
+        env:
+          PROXY: ${{ secrets.PROXYRACK_PROXY_URL }}
+        run: |
+          echo "=== direct curl (no proxy) ==="
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" --max-time 10 https://api.weather.gov/alerts/active || echo "direct curl failed"
+          echo "=== through ProxyRack ==="
+          curl -sS -o /tmp/proxytest -w "HTTP %{http_code} %{time_total}s tier_size=%{size_download}\n" \
+            --max-time 30 -x "$PROXY" https://api.weather.gov/alerts/active || echo "proxied curl failed"
+          echo "=== first 200 chars of proxied response ==="
+          head -c 200 /tmp/proxytest 2>/dev/null
+          echo
+          echo "=== retry with explicit US country modifier ==="
+          PROXY_US="${PROXY/@/-country-US-proxyUptime-10m@}"
+          curl -sS -o /tmp/proxytest2 -w "HTTP %{http_code} %{time_total}s\n" \
+            --max-time 30 -x "$PROXY_US" https://api.weather.gov/alerts/active || echo "us-pinned proxy failed"
+          head -c 200 /tmp/proxytest2 2>/dev/null
