@@ -1038,12 +1038,115 @@ async def _pp_entsoe():
     return []
 
 
+# Cache last good per-source result so a transient failure in one source
+# never zeroes the merged layer — same pattern as fetch_cctv's _CCTV_LAST_GOOD.
+_PP_LAST_GOOD: dict[str, list] = {}
+
+
+async def _pp_osm() -> list:
+    """Existing OSM bbox-tiled fetcher, wrapped to match the per-source signature."""
+    raw = await _overpass_world(POWER_PLANTS_CLAUSE, OSM_WORLD_BOXES, concurrency=4)
+    return _normalize_power(raw)
+
+
+def _pp_merge(sources: list[tuple[str, list]]) -> list:
+    """Merge per-source items into a single deduped list.
+
+    OSM is the geometric primary (its records keep ids unchanged). WRI/EIA
+    records ENRICH a matching OSM record (filling capacity_mw, primary_fuel,
+    operator, country, commissioning_year when OSM left them blank) and
+    contribute to its `sources` list. When no OSM match exists, the alt
+    source row is added verbatim.
+
+    The merge order matters for collision precedence: OSM first, then WRI,
+    then EIA. This means EIA wins the enrich for US plants (richer than WRI
+    for US), WRI wins everywhere else.
+    """
+    by_key: dict = {}
+    out: list = []
+    # 1) Seed with OSM (primary records).
+    osm_items = next((it for label, it in sources if label == "osm"), [])
+    for it in osm_items:
+        k = _pp_dedup_key(it["lat"], it["lng"], it.get("operator"))
+        by_key[k] = it
+        out.append(it)
+    # 2) Layer in non-OSM sources in declared order.
+    for label, items in sources:
+        if label == "osm":
+            continue
+        for it in items:
+            k = _pp_dedup_key(it["lat"], it["lng"], it.get("operator"))
+            existing = by_key.get(k)
+            if existing is None:
+                # Geo-only fallback key (operator missing/different across sources
+                # is the common case — e.g. WRI 'Pacific Gas & Electric Co' vs
+                # OSM 'PG&E'). Try the lat/lng cell with empty operator before
+                # accepting a new record.
+                geo_k = (k[0], k[1], "")
+                existing = by_key.get(geo_k)
+            if existing is None:
+                by_key[k] = it
+                out.append(it)
+                continue
+            # Enrich existing — fill blank fields; never overwrite OSM ground truth.
+            for field in ("capacity_mw", "primary_fuel", "operator", "country",
+                          "commissioning_year", "label"):
+                if not existing.get(field) and it.get(field):
+                    existing[field] = it[field]
+            # primary_fuel might be "Other" on OSM; prefer a non-Other value
+            # from an enriching source.
+            if existing.get("primary_fuel") == "Other" and it.get("primary_fuel") not in (None, "Other"):
+                existing["primary_fuel"] = it["primary_fuel"]
+                existing["category"] = it["primary_fuel"]
+                existing["color"] = _color_by_fuel(it["primary_fuel"])
+            srcs = existing.setdefault("sources", [])
+            for s in it.get("sources", []):
+                if s not in srcs:
+                    srcs.append(s)
+    # Final sweep: ensure color matches whatever fuel we ended with.
+    for it in out:
+        it["color"] = _color_by_fuel(it.get("primary_fuel") or "Other")
+    return out
+
+
 async def fetch_power_plants():
-    try:
-        raw = await _overpass_world(POWER_PLANTS_CLAUSE, OSM_WORLD_BOXES, concurrency=4)
-        return _payload("power_plants", _normalize_power(raw))
-    except Exception:
-        return _payload("power_plants", [])
+    """Merged power_plants layer: OSM (geometry primary) + WRI (global attrs)
+    + EIA-860 (US per-plant). Each source isolated with its own try/except
+    and a last-good cache so one source's failure never zeroes the layer."""
+
+    async def _safe(label: str, coro):
+        try:
+            items = await coro
+            n = len([r for r in items if r.get("lat") is not None
+                     and r.get("lng") is not None])
+            if n > 0:
+                _PP_LAST_GOOD[label] = items
+                print(f"power_plants: {label} -> {n} plants")
+                return items
+            cached = _PP_LAST_GOOD.get(label)
+            if cached:
+                print(f"power_plants: {label} -> 0 plants, reusing {len(cached)} cached")
+                return cached
+            print(f"power_plants: {label} -> 0 plants (no cache)")
+            return []
+        except Exception as e:
+            cached = _PP_LAST_GOOD.get(label)
+            if cached:
+                print(f"power_plants: {label} FAIL {type(e).__name__}: {e}; "
+                      f"reusing {len(cached)} cached")
+                return cached
+            print(f"power_plants: {label} FAIL {type(e).__name__}: {e}")
+            return []
+
+    osm = await _safe("osm", _pp_osm())
+    wri = await _safe("wri", _pp_wri())
+    eia = await _safe("eia860", _pp_eia860())
+    entsoe = await _safe("entsoe", _pp_entsoe())  # currently no-op
+    merged = _pp_merge([("osm", osm), ("wri", wri), ("eia860", eia),
+                        ("entsoe", entsoe)])
+    print(f"power_plants: merged -> {len(merged)} (osm={len(osm)} "
+          f"wri={len(wri)} eia={len(eia)} entsoe={len(entsoe)})")
+    return _payload("power_plants", merged)
 
 
 HOSPITALS_CLAUSE = (
