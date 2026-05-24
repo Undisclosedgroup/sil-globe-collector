@@ -52,6 +52,14 @@ jobs:
           restore-keys: |
             kinetic-state-
 
+      - name: Debug secret presence
+        env:
+          WEBSHARE_POOL_B64: ${{ secrets.WEBSHARE_POOL_B64 }}
+          PROXYRACK_USERNAME: ${{ secrets.PROXYRACK_USERNAME }}
+        run: |
+          echo "WEBSHARE_POOL_B64 length: ${#WEBSHARE_POOL_B64}"
+          echo "PROXYRACK_USERNAME length: ${#PROXYRACK_USERNAME}"
+
       - name: Run tick
         env:
           # Webshare datacenter pool — ProxyRack residential refuses CONNECT
