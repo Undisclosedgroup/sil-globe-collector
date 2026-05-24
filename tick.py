@@ -72,7 +72,7 @@ def _collect_layer_specs():
     return [s for s in specs if s.get("id") != "boats"]
 
 
-_LAYER_TIMEOUT_S = 120
+_LAYER_TIMEOUT_S = 120  # default; cctv/power_plants/hospitals get 300s below
 _LAYER_SEM = asyncio.Semaphore(8)  # cap concurrent layers — GH runner + Webshare pool sanity
 
 
@@ -88,9 +88,10 @@ async def _tick_layer(spec):
     t0 = time.monotonic()
     async with _LAYER_SEM:
         try:
-            payload = await asyncio.wait_for(fetch(), timeout=_LAYER_TIMEOUT_S)
+            timeout = _LAYER_TIMEOUT_OVERRIDES.get(lid, _LAYER_TIMEOUT_DEFAULT)
+            payload = await asyncio.wait_for(fetch(), timeout=timeout)
         except asyncio.TimeoutError:
-            return lid, None, f"timeout after {_LAYER_TIMEOUT_S}s"
+            return lid, None, f"timeout after {timeout}s"
         except Exception as e:
             return lid, None, f"{type(e).__name__}: {e}"
 
