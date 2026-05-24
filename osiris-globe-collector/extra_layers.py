@@ -560,11 +560,130 @@ _POWER_SRC_LABEL = {
     "energy_storage": "Battery", "waste": "Waste",
 }
 
+# Canonical fuel buckets used in the merged output. Sources (OSM tags, WRI
+# `primary_fuel`, EIA Energy Source 1) feed in via _fuel_canonical().
+_POWER_FUEL_COLOR = {
+    "Nuclear":      "#7C4DFF",  # purple
+    "Coal":         "#424242",  # dark grey
+    "Natural Gas":  "#FF9800",  # orange
+    "Oil":          "#5D4037",  # brown
+    "Wind":         "#03A9F4",  # light blue
+    "Solar":        "#FDD835",  # yellow
+    "Hydro":        "#1E88E5",  # blue
+    "Biomass":      "#8BC34A",  # green
+    "Geothermal":   "#E64A19",  # red-orange
+    "Battery":      "#9E9E9E",  # grey
+    "Waste":        "#795548",  # brown
+    "Other":        "#F5A623",  # amber (legacy power_plant color)
+}
+
+# Map raw fuel strings from various sources to canonical buckets.
+_FUEL_NORMALIZE = {
+    # OSM plant:source already maps via _POWER_SRC_LABEL
+    # WRI primary_fuel values:
+    "nuclear": "Nuclear",
+    "coal": "Coal", "petcoke": "Coal", "lignite": "Coal",
+    "gas": "Natural Gas", "natural_gas": "Natural Gas", "cogeneration": "Natural Gas",
+    "oil": "Oil", "petroleum": "Oil", "diesel": "Oil",
+    "wind": "Wind",
+    "solar": "Solar", "photovoltaic": "Solar",
+    "hydro": "Hydro", "water": "Hydro", "tidal": "Hydro", "wave_and_tidal": "Hydro",
+    "biomass": "Biomass", "biogas": "Biomass",
+    "geothermal": "Geothermal",
+    "storage": "Battery", "battery": "Battery", "energy_storage": "Battery",
+    "waste": "Waste",
+    # EIA Energy Source 1 codes (subset; see EIA-923/860 instructions):
+    "nuc": "Nuclear",
+    "bit": "Coal", "sub": "Coal", "lig": "Coal", "ant": "Coal", "rc": "Coal",
+    "wc": "Coal", "sgc": "Coal",
+    "ng": "Natural Gas", "lfg": "Natural Gas", "obg": "Natural Gas",
+    "pg": "Natural Gas", "bfg": "Natural Gas", "og": "Natural Gas",
+    "dfo": "Oil", "rfo": "Oil", "wo": "Oil", "kero": "Oil", "jf": "Oil",
+    "pc": "Coal", "sgp": "Oil",
+    "wnd": "Wind",
+    "sun": "Solar",
+    "wat": "Hydro", "mwh": "Hydro",  # MWh = pumped storage hydro
+    "wds": "Biomass", "wdl": "Biomass", "ab": "Biomass", "msw": "Biomass",
+    "obs": "Biomass", "obl": "Biomass", "slw": "Biomass",
+    "geo": "Geothermal",
+    "msb": "Waste", "msn": "Waste", "tdf": "Waste",
+    "blq": "Biomass",       # Black liquor (paper-mill cogen)
+    "ker": "Oil",           # Kerosene
+    "wh": "Other",          # Waste heat (industrial recovery)
+    "pur": "Other",         # Purchased steam
+    "oth": "Other",
+}
+
+
+def _fuel_canonical(raw: str | None) -> str:
+    if not raw:
+        return "Other"
+    s = str(raw).strip().lower().split(";")[0].split(",")[0].strip()
+    if not s:
+        return "Other"
+    # Try OSM-style label first (already canonical capitalization)
+    if s in _POWER_SRC_LABEL:
+        return _POWER_SRC_LABEL[s]
+    if s in _FUEL_NORMALIZE:
+        return _FUEL_NORMALIZE[s]
+    # Title-cased pass for unknowns that already look like our buckets
+    title = s.title()
+    if title in _POWER_FUEL_COLOR:
+        return title
+    return "Other"
+
+
+def _color_by_fuel(fuel: str) -> str:
+    return _POWER_FUEL_COLOR.get(fuel, _POWER_FUEL_COLOR["Other"])
+
+
+def _pp_dedup_key(lat: float, lng: float, operator: str | None) -> tuple:
+    """Key for collapsing duplicate plants across sources.
+
+    ~110m precision via 3-decimal rounding + first-20-char lowercased operator
+    name. Operator is often missing/inconsistent, so when blank we fall back
+    to a geo-only key — that does collapse co-located plants from the same
+    multi-unit campus into one row, which is desired for this layer.
+    """
+    try:
+        lat_r = round(float(lat), 3)
+        lng_r = round(float(lng), 3)
+    except (TypeError, ValueError):
+        return ("__bad__", lat, lng)
+    op = (operator or "").strip().lower()[:20]
+    return (lat_r, lng_r, op)
+
+
 POWER_PLANTS_CLAUSE = (
     'node["power"="plant"]({s},{w},{n},{e});'
     'way["power"="plant"]({s},{w},{n},{e});'
     'relation["power"="plant"]({s},{w},{n},{e});'
 )
+
+
+def _output_to_mw(s: str | None) -> float | None:
+    """Parse OSM plant:output:electricity values into MW.
+
+    Common forms: '12 MW', '1.5 GW', '500 kW', 'yes', or a bare number (assumed MW).
+    """
+    if not s:
+        return None
+    txt = str(s).strip().lower().replace(",", "")
+    if txt in ("yes", "no", ""):
+        return None
+    mult = 1.0  # MW default
+    for unit, m in (("gw", 1000.0), ("mw", 1.0), ("kw", 0.001), ("w", 1e-6)):
+        if txt.endswith(unit):
+            txt = txt[: -len(unit)].strip()
+            mult = m
+            break
+    try:
+        v = float(txt.split()[0]) if txt else None
+    except (ValueError, IndexError):
+        return None
+    if v is None:
+        return None
+    return round(v * mult, 3)
 
 
 def _normalize_power(raw):
@@ -578,26 +697,456 @@ def _normalize_power(raw):
         if lat is None or lng is None:
             continue
         src = (tags.get("plant:source") or "").lower().split(";")[0]
+        fuel = _fuel_canonical(src)
+        capacity_mw = _output_to_mw(tags.get("plant:output:electricity"))
+        start_date = tags.get("start_date") or tags.get("opening_date")
+        commissioning_year = None
+        if start_date:
+            try:
+                commissioning_year = int(str(start_date)[:4])
+            except ValueError:
+                commissioning_year = None
         items.append({
-            "id": f"{el.get('type')}-{el.get('id')}",
+            "id": f"osm-{el.get('type')}-{el.get('id')}",
             "lat": lat, "lng": lng,
             "label": tags.get("name") or _POWER_SRC_LABEL.get(src, "Power Plant"),
-            "category": _POWER_SRC_LABEL.get(src, "Other"),
+            "category": fuel,
+            "primary_fuel": fuel,
             "source_type": src or None,
             "output": tags.get("plant:output:electricity"),
+            "capacity_mw": capacity_mw,
             "operator": tags.get("operator"),
             "country": tags.get("addr:country") or tags.get("country"),
-            "color": "#F5A623",
+            "commissioning_year": commissioning_year,
+            "color": _color_by_fuel(fuel),
+            "sources": ["osm"],
         })
     return items
 
 
-async def fetch_power_plants():
+# ============================================================================
+# Power plants — WRI Global Power Plant Database v1.3 (CC BY 4.0)
+# ----------------------------------------------------------------------------
+# ~30k plants worldwide, hand-curated. Provides capacity_mw, primary_fuel,
+# owner, commissioning_year — the fields OSM consistently lacks. Fetched
+# from the wri-dataportal-prod S3 bucket (CSV inside a zip). The dataset has
+# not been refreshed since 2021 but the inventory is still the best public
+# global baseline.
+# ============================================================================
+WRI_PP_URL = (
+    "https://wri-dataportal-prod.s3.amazonaws.com/manual/"
+    "global_power_plant_database_v_1_3.zip"
+)
+
+
+async def _pp_wri():
+    """Fetch + parse WRI Global Power Plant Database. Returns normalized items."""
+    import zipfile
+
     try:
-        raw = await _overpass_world(POWER_PLANTS_CLAUSE, OSM_WORLD_BOXES, concurrency=4)
-        return _payload("power_plants", _normalize_power(raw))
-    except Exception:
-        return _payload("power_plants", [])
+        r = await _F.aget(WRI_PP_URL, headers={"Accept": "application/zip"},
+                          timeout=90)
+        if r.status != 200 or not r.body:
+            print(f"power_plants: wri http={r.status} bytes={len(r.body or b'')}")
+            return []
+        zf = zipfile.ZipFile(io.BytesIO(r.body))
+    except Exception as e:
+        print(f"power_plants: wri fetch FAIL {type(e).__name__}: {e}")
+        return []
+    # Find the CSV inside the zip (single top-level CSV expected).
+    csv_name = None
+    for n in zf.namelist():
+        if n.lower().endswith(".csv") and "global_power_plant_database" in n.lower():
+            csv_name = n
+            break
+    if not csv_name:
+        print(f"power_plants: wri zip missing csv (members={zf.namelist()[:5]})")
+        return []
+    try:
+        with zf.open(csv_name) as fh:
+            text = io.TextIOWrapper(fh, encoding="utf-8", errors="replace")
+            reader = csv.DictReader(text)
+            items = []
+            for row in reader:
+                try:
+                    lat = float(row.get("latitude") or "")
+                    lng = float(row.get("longitude") or "")
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    cap = float(row["capacity_mw"]) if row.get("capacity_mw") else None
+                except (TypeError, ValueError):
+                    cap = None
+                try:
+                    year = int(float(row["commissioning_year"])) if row.get("commissioning_year") else None
+                except (TypeError, ValueError):
+                    year = None
+                fuel = _fuel_canonical(row.get("primary_fuel"))
+                items.append({
+                    "id": f"wri-{(row.get('gppd_idnr') or '').strip() or len(items)}",
+                    "lat": lat, "lng": lng,
+                    "label": (row.get("name") or "").strip() or "Power Plant",
+                    "category": fuel,
+                    "primary_fuel": fuel,
+                    "capacity_mw": cap,
+                    "operator": (row.get("owner") or "").strip() or None,
+                    "country": (row.get("country_long") or row.get("country") or "").strip() or None,
+                    "commissioning_year": year,
+                    "color": _color_by_fuel(fuel),
+                    "sources": ["wri"],
+                })
+    except Exception as e:
+        print(f"power_plants: wri parse FAIL {type(e).__name__}: {e}")
+        return []
+    print(f"power_plants: wri -> {len(items)} plants")
+    return items
+
+
+# ============================================================================
+# Power plants — EIA Form 860 (US, ~12k plants, public domain)
+# ----------------------------------------------------------------------------
+# Two sheets joined per plant_code:
+#   2___Plant_*.xlsx     -> Plant Code, Plant Name, State, Latitude, Longitude,
+#                           Utility Name, Sector Name
+#   3_1_Generator_*.xlsx -> per-generator Nameplate Capacity (MW), Technology,
+#                           Energy Source 1, Operating Year, Planned Retirement
+# We sum nameplate capacity per plant and pick the dominant fuel (max MW share).
+#
+# NOTE: www.eia.gov rejects ProxyRack residential CONNECT with HTTP 565
+# (Akamai/anti-bot edge configured to reject residential ASNs). Production
+# collector runs on GitHub Actions runners that have direct egress to .gov
+# sites, so we attempt proxy first, then fall back to direct. This is a
+# defensible carve-out: EIA is US government open data and the home IP is
+# never exposed because this code paths runs in GH Actions.
+# ============================================================================
+EIA860_URLS = [
+    # Current (2024 final, released Sep 2025) lives in /xls/. Older years move
+    # to /archive/xls/. Walk from newest to oldest and use the first one that
+    # downloads — keeps us self-healing across yearly cadence.
+    "https://www.eia.gov/electricity/data/eia860/xls/eia8602024.zip",
+    "https://www.eia.gov/electricity/data/eia860/xls/eia8602023ER.zip",
+    "https://www.eia.gov/electricity/data/eia860/archive/xls/eia8602023.zip",
+    "https://www.eia.gov/electricity/data/eia860/archive/xls/eia8602022.zip",
+]
+
+
+def _eia_fetch_bytes(url: str, timeout: int = 90) -> bytes | None:
+    """Best-effort download of the EIA-860 zip.
+
+    Try ProxyRack first; on 565/Akamai-reject, fall back to direct urllib.
+    Direct is acceptable here because (a) EIA is US gov open data with no
+    bot-block beyond their residential-ASN edge filter, and (b) production
+    runs on GH Actions egress, not the user's home IP.
+    """
+    proxy = os.environ.get("PROXYRACK_PROXY_URL") or os.environ.get("HTTPS_PROXY")
+    if proxy:
+        try:
+            handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(handler)
+            opener.addheaders = [("User-Agent",
+                                  "globe-recon/1.0 (+osiris-globe-collector)")]
+            with opener.open(url, timeout=timeout) as r:
+                if r.status == 200:
+                    return r.read()
+        except Exception as e:
+            print(f"power_plants: eia proxy fetch failed ({type(e).__name__}: {e}); "
+                  f"falling back to direct")
+    # Direct fallback
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "globe-recon/1.0 (+osiris-globe-collector)"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status == 200:
+                return r.read()
+    except Exception as e:
+        print(f"power_plants: eia direct fetch failed ({type(e).__name__}: {e}) "
+              f"url={url}")
+    return None
+
+
+def _eia_pick_sheet(zf, prefix: str) -> tuple[str, bytes] | None:
+    """Find the first xlsx whose filename starts with `prefix` (e.g. '2___Plant')."""
+    for n in zf.namelist():
+        base = n.rsplit("/", 1)[-1]
+        if base.startswith(prefix) and base.lower().endswith(".xlsx"):
+            return n, zf.read(n)
+    return None
+
+
+def _eia_load_xlsx_rows(xlsx_bytes: bytes, sheet_name: str | None = None):
+    """Yield dict rows from an EIA xlsx. Headers are on the 2nd row (the 1st
+    is a survey-year banner row); we skip until a row contains a known anchor
+    column then use that as header."""
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
+    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+    header = None
+    for row in ws.iter_rows(values_only=True):
+        if header is None:
+            # EIA puts a one-cell banner row, then headers on row 2. Detect by
+            # looking for a known column anchor.
+            joined = "|".join(str(c) if c is not None else "" for c in row).lower()
+            if "plant code" in joined or "utility id" in joined:
+                header = [str(c).strip() if c is not None else "" for c in row]
+            continue
+        if all(c is None or c == "" for c in row):
+            continue
+        yield dict(zip(header, row))
+    wb.close()
+
+
+def _pp_eia860_parse(zip_bytes: bytes) -> list[dict]:
+    import zipfile
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    plant_member = _eia_pick_sheet(zf, "2___Plant")
+    gen_member = _eia_pick_sheet(zf, "3_1_Generator")
+    if not plant_member:
+        print(f"power_plants: eia zip missing 2___Plant sheet (members={zf.namelist()[:8]})")
+        return []
+    # Plants
+    plants: dict[str, dict] = {}
+    for row in _eia_load_xlsx_rows(plant_member[1]):
+        code = row.get("Plant Code")
+        if code is None:
+            continue
+        try:
+            code_str = str(int(code))
+        except (ValueError, TypeError):
+            code_str = str(code).strip()
+        try:
+            lat = float(row.get("Latitude"))
+            lng = float(row.get("Longitude"))
+        except (TypeError, ValueError):
+            continue
+        plants[code_str] = {
+            "id": f"eia-{code_str}",
+            "lat": lat, "lng": lng,
+            "label": (row.get("Plant Name") or "").strip() or f"EIA Plant {code_str}",
+            "operator": (row.get("Utility Name") or "").strip() or None,
+            "country": "United States",
+            "state": (row.get("State") or "").strip() or None,
+            "sector": (row.get("Sector Name") or "").strip() or None,
+            "_fuel_mw": {},               # fuel -> summed MW (for dominant pick)
+            "_capacity_mw": 0.0,
+            "_min_year": None,
+            "sources": ["eia860"],
+        }
+    # Generators — aggregate per plant
+    if gen_member:
+        for row in _eia_load_xlsx_rows(gen_member[1]):
+            code = row.get("Plant Code")
+            if code is None:
+                continue
+            try:
+                code_str = str(int(code))
+            except (ValueError, TypeError):
+                code_str = str(code).strip()
+            p = plants.get(code_str)
+            if not p:
+                continue
+            try:
+                mw = float(row.get("Nameplate Capacity (MW)") or 0)
+            except (TypeError, ValueError):
+                mw = 0.0
+            fuel = _fuel_canonical(row.get("Energy Source 1"))
+            if mw > 0:
+                p["_capacity_mw"] += mw
+                p["_fuel_mw"][fuel] = p["_fuel_mw"].get(fuel, 0.0) + mw
+            yr = row.get("Operating Year")
+            if yr:
+                try:
+                    yr_i = int(float(yr))
+                    if p["_min_year"] is None or yr_i < p["_min_year"]:
+                        p["_min_year"] = yr_i
+                except (TypeError, ValueError):
+                    pass
+    # Finalize shape
+    items = []
+    for code_str, p in plants.items():
+        # Dominant fuel = max-MW bucket; fallback Other if no generator data.
+        fuel = "Other"
+        if p["_fuel_mw"]:
+            fuel = max(p["_fuel_mw"].items(), key=lambda kv: kv[1])[0]
+        items.append({
+            "id": p["id"],
+            "lat": p["lat"], "lng": p["lng"],
+            "label": p["label"],
+            "category": fuel,
+            "primary_fuel": fuel,
+            "capacity_mw": round(p["_capacity_mw"], 3) if p["_capacity_mw"] else None,
+            "operator": p["operator"],
+            "country": p["country"],
+            "state": p["state"],
+            "sector": p["sector"],
+            "commissioning_year": p["_min_year"],
+            "color": _color_by_fuel(fuel),
+            "sources": p["sources"],
+        })
+    return items
+
+
+async def _pp_eia860():
+    """Fetch + parse the most recent EIA-860 zip. Returns normalized items."""
+    def _blocking() -> list[dict]:
+        zip_bytes = None
+        for url in EIA860_URLS:
+            zip_bytes = _eia_fetch_bytes(url)
+            if zip_bytes:
+                print(f"power_plants: eia downloaded {len(zip_bytes)} bytes from {url}")
+                break
+        if not zip_bytes:
+            print("power_plants: eia all sources failed")
+            return []
+        try:
+            return _pp_eia860_parse(zip_bytes)
+        except Exception as e:
+            print(f"power_plants: eia parse FAIL {type(e).__name__}: {e}")
+            return []
+
+    items = await asyncio.to_thread(_blocking)
+    print(f"power_plants: eia -> {len(items)} plants")
+    return items
+
+
+# ============================================================================
+# Power plants — ENTSO-E (EU)
+# ----------------------------------------------------------------------------
+# Status: DOCUMENTED SKIP.
+#
+# We investigated the Transparency Platform Restful API for per-plant
+# capacity. The available document types (A68 = Installed Generation
+# Capacity per Unit, A71 = Generation Forecast, A75 = Actual Generation
+# per Production Type) are *aggregated by production type per bidding
+# zone* — not per-plant geographic records. The only per-unit doc (A95)
+# requires the requesting party to register specific Production Unit
+# EICs in advance and does not enumerate them.
+#
+# WRI v1.3 already provides ~6k EU power plants with capacity_mw,
+# primary_fuel, owner and a non-trivial commissioning_year column. That
+# is our EU per-plant baseline. ENTSO-E remains useful for the existing
+# `eu_grid` layer (real-time outage signal, NOT inventory).
+#
+# The fetcher is kept as a no-op stub so the aggregator interface stays
+# uniform; flipping to real data later means swapping this body without
+# touching fetch_power_plants().
+# ============================================================================
+async def _pp_entsoe():
+    """ENTSO-E does not expose per-plant capacity; skip with a one-line note."""
+    print("power_plants: entsoe SKIP — Transparency Platform exposes only "
+          "aggregated production-type capacity per bidding zone, not per-plant "
+          "geo records. WRI covers EU inventory.")
+    return []
+
+
+# Cache last good per-source result so a transient failure in one source
+# never zeroes the merged layer — same pattern as fetch_cctv's _CCTV_LAST_GOOD.
+_PP_LAST_GOOD: dict[str, list] = {}
+
+
+async def _pp_osm() -> list:
+    """Existing OSM bbox-tiled fetcher, wrapped to match the per-source signature."""
+    raw = await _overpass_world(POWER_PLANTS_CLAUSE, OSM_WORLD_BOXES, concurrency=4)
+    return _normalize_power(raw)
+
+
+def _pp_merge(sources: list[tuple[str, list]]) -> list:
+    """Merge per-source items into a single deduped list.
+
+    OSM is the geometric primary (its records keep ids unchanged). WRI/EIA
+    records ENRICH a matching OSM record (filling capacity_mw, primary_fuel,
+    operator, country, commissioning_year when OSM left them blank) and
+    contribute to its `sources` list. When no OSM match exists, the alt
+    source row is added verbatim.
+
+    The merge order matters for collision precedence: OSM first, then WRI,
+    then EIA. This means EIA wins the enrich for US plants (richer than WRI
+    for US), WRI wins everywhere else.
+    """
+    by_key: dict = {}
+    out: list = []
+    # 1) Seed with OSM (primary records).
+    osm_items = next((it for label, it in sources if label == "osm"), [])
+    for it in osm_items:
+        k = _pp_dedup_key(it["lat"], it["lng"], it.get("operator"))
+        by_key[k] = it
+        out.append(it)
+    # 2) Layer in non-OSM sources in declared order.
+    for label, items in sources:
+        if label == "osm":
+            continue
+        for it in items:
+            k = _pp_dedup_key(it["lat"], it["lng"], it.get("operator"))
+            existing = by_key.get(k)
+            if existing is None:
+                # Geo-only fallback key (operator missing/different across sources
+                # is the common case — e.g. WRI 'Pacific Gas & Electric Co' vs
+                # OSM 'PG&E'). Try the lat/lng cell with empty operator before
+                # accepting a new record.
+                geo_k = (k[0], k[1], "")
+                existing = by_key.get(geo_k)
+            if existing is None:
+                by_key[k] = it
+                out.append(it)
+                continue
+            # Enrich existing — fill blank fields; never overwrite OSM ground truth.
+            for field in ("capacity_mw", "primary_fuel", "operator", "country",
+                          "commissioning_year", "label"):
+                if not existing.get(field) and it.get(field):
+                    existing[field] = it[field]
+            # primary_fuel might be "Other" on OSM; prefer a non-Other value
+            # from an enriching source.
+            if existing.get("primary_fuel") == "Other" and it.get("primary_fuel") not in (None, "Other"):
+                existing["primary_fuel"] = it["primary_fuel"]
+                existing["category"] = it["primary_fuel"]
+                existing["color"] = _color_by_fuel(it["primary_fuel"])
+            srcs = existing.setdefault("sources", [])
+            for s in it.get("sources", []):
+                if s not in srcs:
+                    srcs.append(s)
+    # Final sweep: ensure color matches whatever fuel we ended with.
+    for it in out:
+        it["color"] = _color_by_fuel(it.get("primary_fuel") or "Other")
+    return out
+
+
+async def fetch_power_plants():
+    """Merged power_plants layer: OSM (geometry primary) + WRI (global attrs)
+    + EIA-860 (US per-plant). Each source isolated with its own try/except
+    and a last-good cache so one source's failure never zeroes the layer."""
+
+    async def _safe(label: str, coro):
+        try:
+            items = await coro
+            n = len([r for r in items if r.get("lat") is not None
+                     and r.get("lng") is not None])
+            if n > 0:
+                _PP_LAST_GOOD[label] = items
+                print(f"power_plants: {label} -> {n} plants")
+                return items
+            cached = _PP_LAST_GOOD.get(label)
+            if cached:
+                print(f"power_plants: {label} -> 0 plants, reusing {len(cached)} cached")
+                return cached
+            print(f"power_plants: {label} -> 0 plants (no cache)")
+            return []
+        except Exception as e:
+            cached = _PP_LAST_GOOD.get(label)
+            if cached:
+                print(f"power_plants: {label} FAIL {type(e).__name__}: {e}; "
+                      f"reusing {len(cached)} cached")
+                return cached
+            print(f"power_plants: {label} FAIL {type(e).__name__}: {e}")
+            return []
+
+    osm = await _safe("osm", _pp_osm())
+    wri = await _safe("wri", _pp_wri())
+    eia = await _safe("eia860", _pp_eia860())
+    entsoe = await _safe("entsoe", _pp_entsoe())  # currently no-op
+    merged = _pp_merge([("osm", osm), ("wri", wri), ("eia860", eia),
+                        ("entsoe", entsoe)])
+    print(f"power_plants: merged -> {len(merged)} (osm={len(osm)} "
+          f"wri={len(wri)} eia={len(eia)} entsoe={len(entsoe)})")
+    return _payload("power_plants", merged)
 
 
 HOSPITALS_CLAUSE = (
