@@ -1156,9 +1156,29 @@ HOSPITALS_CLAUSE = (
 )
 
 
+def _safe_int(v):
+    """Coerce OSM beds tag to int; OSM data is dirty ('120', '~50', '50+'),
+    so strip non-digit suffixes and return None on failure."""
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        digits = ""
+        for ch in s:
+            if ch.isdigit():
+                digits += ch
+            elif digits:
+                break
+        return int(digits) if digits else None
+    except Exception:
+        return None
+
+
 def _normalize_hospitals(raw):
     items = []
-    for el in raw.get("elements", []):
+    for i, el in enumerate(raw.get("elements", [])):
         tags = el.get("tags") or {}
         lat, lng = el.get("lat"), el.get("lon")
         center = el.get("center")
@@ -1166,40 +1186,77 @@ def _normalize_hospitals(raw):
             lat, lng = center.get("lat"), center.get("lon")
         if lat is None or lng is None:
             continue
+        t = el.get("type")
+        eid = el.get("id")
         items.append({
-            "id": f"{el.get('type')}-{el.get('id')}",
+            "id": f"hosp-{t}-{eid}",
             "lat": lat, "lng": lng,
-            "label": tags.get("name") or "Hospital",
+            "label": tags.get("name") or tags.get("name:en") or "Hospital",
             "operator": tags.get("operator"),
-            "emergency": tags.get("emergency"),
-            "country": tags.get("addr:country"),
-            "city": tags.get("addr:city"),
+            "emergency": tags.get("emergency") == "yes",
+            "beds": _safe_int(tags.get("beds")),
+            "country": tags.get("addr:country") or tags.get("is_in:country"),
             "color": "#FF1744",
         })
     return items
 
 
-async def fetch_hospitals():
-    """Density-tuned ~200 bbox set + STRICTLY SEQUENTIAL gather (concurrency=1)
-    plus per-box retry on 504/429. Each box is 1-12° depending on hospital
-    density. Sequential avoids the DNS-resolver burst that broke prior attempts.
-    Daily cadence so the slow run (~5-15 min on a clean day) is fine."""
-    seen = set()
-    out = []
-    for box in OSM_HOSPITAL_BOXES:
+async def _hospitals_one_box(bbox: tuple, endpoint: str):
+    """Hospitals-tuned per-box Overpass runner. ProxyRack residential drops
+    long-lived connections at ~16s, so Overpass server timeout is capped at
+    25s and client at 28s. Retries on 504/429/connection-drop with short
+    backoff. Returns [] on permanent failure (don't abort the world sweep)."""
+    s, w, n, e = bbox
+    body = HOSPITALS_CLAUSE.format(s=s, w=w, n=n, e=e)
+    ql = f'[out:json][timeout:25];({body});out center tags;'
+    url = endpoint + "?data=" + urllib.parse.quote(ql, safe="")
+    for attempt in range(3):
         try:
-            elements = await _overpass_one_box(HOSPITALS_CLAUSE, box)
-            for el in elements:
+            r = await _F.aget(url, headers=OVERPASS_HDR, timeout=28)
+            if r.status == 200 and r.body:
+                try:
+                    return json.loads(r.body).get("elements", []) or []
+                except Exception:
+                    return []
+            if r.status in (-1, 429, 502, 503, 504):
+                await asyncio.sleep(1 + attempt)
+                continue
+            return []
+        except Exception:
+            await asyncio.sleep(1 + attempt)
+    return []
+
+
+async def fetch_hospitals():
+    """Bbox-tiled Overpass — same shape as fetch_power_plants (per-box async
+    + asyncio.Semaphore + (type,id) dedup) but uses the density-tuned
+    OSM_HOSPITAL_BOXES split across both Overpass mirrors (main + kumi) to
+    bypass overpass-api.de's 4-slot-per-IP limit. Round-robin assignment
+    means concurrency=8 = 4 per server. Tighter per-box timeouts fit inside
+    ProxyRack residential's ~16s connection ceiling on dense queries."""
+    try:
+        boxes = OSM_HOSPITAL_BOXES
+        sem = asyncio.Semaphore(8)
+
+        async def _one(i_b):
+            i, b = i_b
+            ep = OVERPASS_ENDPOINTS[i % len(OVERPASS_ENDPOINTS)]
+            async with sem:
+                return await _hospitals_one_box(b, ep)
+
+        results = await asyncio.gather(*(_one(ib) for ib in enumerate(boxes)))
+        seen = set()
+        merged = []
+        for r in results:
+            for el in r:
                 key = (el.get("type"), el.get("id"))
                 if key in seen:
                     continue
                 seen.add(key)
-                out.append(el)
-            # Small inter-box delay to be polite to Overpass + dodge DNS bursts.
-            await asyncio.sleep(0.3)
-        except Exception:
-            continue
-    return _payload("hospitals", _normalize_hospitals({"elements": out}))
+                merged.append(el)
+        return _payload("hospitals", _normalize_hospitals({"elements": merged}))
+    except Exception:
+        return _payload("hospitals", [])
 
 
 # ============================================================================
