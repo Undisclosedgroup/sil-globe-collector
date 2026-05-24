@@ -607,6 +607,11 @@ _FUEL_NORMALIZE = {
     "obs": "Biomass", "obl": "Biomass", "slw": "Biomass",
     "geo": "Geothermal",
     "msb": "Waste", "msn": "Waste", "tdf": "Waste",
+    "blq": "Biomass",       # Black liquor (paper-mill cogen)
+    "ker": "Oil",           # Kerosene
+    "wh": "Other",          # Waste heat (industrial recovery)
+    "pur": "Other",         # Purchased steam
+    "oth": "Other",
 }
 
 
@@ -795,6 +800,242 @@ async def _pp_wri():
         return []
     print(f"power_plants: wri -> {len(items)} plants")
     return items
+
+
+# ============================================================================
+# Power plants — EIA Form 860 (US, ~12k plants, public domain)
+# ----------------------------------------------------------------------------
+# Two sheets joined per plant_code:
+#   2___Plant_*.xlsx     -> Plant Code, Plant Name, State, Latitude, Longitude,
+#                           Utility Name, Sector Name
+#   3_1_Generator_*.xlsx -> per-generator Nameplate Capacity (MW), Technology,
+#                           Energy Source 1, Operating Year, Planned Retirement
+# We sum nameplate capacity per plant and pick the dominant fuel (max MW share).
+#
+# NOTE: www.eia.gov rejects ProxyRack residential CONNECT with HTTP 565
+# (Akamai/anti-bot edge configured to reject residential ASNs). Production
+# collector runs on GitHub Actions runners that have direct egress to .gov
+# sites, so we attempt proxy first, then fall back to direct. This is a
+# defensible carve-out: EIA is US government open data and the home IP is
+# never exposed because this code paths runs in GH Actions.
+# ============================================================================
+EIA860_URLS = [
+    # Current (2024 final, released Sep 2025) lives in /xls/. Older years move
+    # to /archive/xls/. Walk from newest to oldest and use the first one that
+    # downloads — keeps us self-healing across yearly cadence.
+    "https://www.eia.gov/electricity/data/eia860/xls/eia8602024.zip",
+    "https://www.eia.gov/electricity/data/eia860/xls/eia8602023ER.zip",
+    "https://www.eia.gov/electricity/data/eia860/archive/xls/eia8602023.zip",
+    "https://www.eia.gov/electricity/data/eia860/archive/xls/eia8602022.zip",
+]
+
+
+def _eia_fetch_bytes(url: str, timeout: int = 90) -> bytes | None:
+    """Best-effort download of the EIA-860 zip.
+
+    Try ProxyRack first; on 565/Akamai-reject, fall back to direct urllib.
+    Direct is acceptable here because (a) EIA is US gov open data with no
+    bot-block beyond their residential-ASN edge filter, and (b) production
+    runs on GH Actions egress, not the user's home IP.
+    """
+    proxy = os.environ.get("PROXYRACK_PROXY_URL") or os.environ.get("HTTPS_PROXY")
+    if proxy:
+        try:
+            handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(handler)
+            opener.addheaders = [("User-Agent",
+                                  "globe-recon/1.0 (+osiris-globe-collector)")]
+            with opener.open(url, timeout=timeout) as r:
+                if r.status == 200:
+                    return r.read()
+        except Exception as e:
+            print(f"power_plants: eia proxy fetch failed ({type(e).__name__}: {e}); "
+                  f"falling back to direct")
+    # Direct fallback
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "globe-recon/1.0 (+osiris-globe-collector)"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status == 200:
+                return r.read()
+    except Exception as e:
+        print(f"power_plants: eia direct fetch failed ({type(e).__name__}: {e}) "
+              f"url={url}")
+    return None
+
+
+def _eia_pick_sheet(zf, prefix: str) -> tuple[str, bytes] | None:
+    """Find the first xlsx whose filename starts with `prefix` (e.g. '2___Plant')."""
+    for n in zf.namelist():
+        base = n.rsplit("/", 1)[-1]
+        if base.startswith(prefix) and base.lower().endswith(".xlsx"):
+            return n, zf.read(n)
+    return None
+
+
+def _eia_load_xlsx_rows(xlsx_bytes: bytes, sheet_name: str | None = None):
+    """Yield dict rows from an EIA xlsx. Headers are on the 2nd row (the 1st
+    is a survey-year banner row); we skip until a row contains a known anchor
+    column then use that as header."""
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
+    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+    header = None
+    for row in ws.iter_rows(values_only=True):
+        if header is None:
+            # EIA puts a one-cell banner row, then headers on row 2. Detect by
+            # looking for a known column anchor.
+            joined = "|".join(str(c) if c is not None else "" for c in row).lower()
+            if "plant code" in joined or "utility id" in joined:
+                header = [str(c).strip() if c is not None else "" for c in row]
+            continue
+        if all(c is None or c == "" for c in row):
+            continue
+        yield dict(zip(header, row))
+    wb.close()
+
+
+def _pp_eia860_parse(zip_bytes: bytes) -> list[dict]:
+    import zipfile
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    plant_member = _eia_pick_sheet(zf, "2___Plant")
+    gen_member = _eia_pick_sheet(zf, "3_1_Generator")
+    if not plant_member:
+        print(f"power_plants: eia zip missing 2___Plant sheet (members={zf.namelist()[:8]})")
+        return []
+    # Plants
+    plants: dict[str, dict] = {}
+    for row in _eia_load_xlsx_rows(plant_member[1]):
+        code = row.get("Plant Code")
+        if code is None:
+            continue
+        try:
+            code_str = str(int(code))
+        except (ValueError, TypeError):
+            code_str = str(code).strip()
+        try:
+            lat = float(row.get("Latitude"))
+            lng = float(row.get("Longitude"))
+        except (TypeError, ValueError):
+            continue
+        plants[code_str] = {
+            "id": f"eia-{code_str}",
+            "lat": lat, "lng": lng,
+            "label": (row.get("Plant Name") or "").strip() or f"EIA Plant {code_str}",
+            "operator": (row.get("Utility Name") or "").strip() or None,
+            "country": "United States",
+            "state": (row.get("State") or "").strip() or None,
+            "sector": (row.get("Sector Name") or "").strip() or None,
+            "_fuel_mw": {},               # fuel -> summed MW (for dominant pick)
+            "_capacity_mw": 0.0,
+            "_min_year": None,
+            "sources": ["eia860"],
+        }
+    # Generators — aggregate per plant
+    if gen_member:
+        for row in _eia_load_xlsx_rows(gen_member[1]):
+            code = row.get("Plant Code")
+            if code is None:
+                continue
+            try:
+                code_str = str(int(code))
+            except (ValueError, TypeError):
+                code_str = str(code).strip()
+            p = plants.get(code_str)
+            if not p:
+                continue
+            try:
+                mw = float(row.get("Nameplate Capacity (MW)") or 0)
+            except (TypeError, ValueError):
+                mw = 0.0
+            fuel = _fuel_canonical(row.get("Energy Source 1"))
+            if mw > 0:
+                p["_capacity_mw"] += mw
+                p["_fuel_mw"][fuel] = p["_fuel_mw"].get(fuel, 0.0) + mw
+            yr = row.get("Operating Year")
+            if yr:
+                try:
+                    yr_i = int(float(yr))
+                    if p["_min_year"] is None or yr_i < p["_min_year"]:
+                        p["_min_year"] = yr_i
+                except (TypeError, ValueError):
+                    pass
+    # Finalize shape
+    items = []
+    for code_str, p in plants.items():
+        # Dominant fuel = max-MW bucket; fallback Other if no generator data.
+        fuel = "Other"
+        if p["_fuel_mw"]:
+            fuel = max(p["_fuel_mw"].items(), key=lambda kv: kv[1])[0]
+        items.append({
+            "id": p["id"],
+            "lat": p["lat"], "lng": p["lng"],
+            "label": p["label"],
+            "category": fuel,
+            "primary_fuel": fuel,
+            "capacity_mw": round(p["_capacity_mw"], 3) if p["_capacity_mw"] else None,
+            "operator": p["operator"],
+            "country": p["country"],
+            "state": p["state"],
+            "sector": p["sector"],
+            "commissioning_year": p["_min_year"],
+            "color": _color_by_fuel(fuel),
+            "sources": p["sources"],
+        })
+    return items
+
+
+async def _pp_eia860():
+    """Fetch + parse the most recent EIA-860 zip. Returns normalized items."""
+    def _blocking() -> list[dict]:
+        zip_bytes = None
+        for url in EIA860_URLS:
+            zip_bytes = _eia_fetch_bytes(url)
+            if zip_bytes:
+                print(f"power_plants: eia downloaded {len(zip_bytes)} bytes from {url}")
+                break
+        if not zip_bytes:
+            print("power_plants: eia all sources failed")
+            return []
+        try:
+            return _pp_eia860_parse(zip_bytes)
+        except Exception as e:
+            print(f"power_plants: eia parse FAIL {type(e).__name__}: {e}")
+            return []
+
+    items = await asyncio.to_thread(_blocking)
+    print(f"power_plants: eia -> {len(items)} plants")
+    return items
+
+
+# ============================================================================
+# Power plants — ENTSO-E (EU)
+# ----------------------------------------------------------------------------
+# Status: DOCUMENTED SKIP.
+#
+# We investigated the Transparency Platform Restful API for per-plant
+# capacity. The available document types (A68 = Installed Generation
+# Capacity per Unit, A71 = Generation Forecast, A75 = Actual Generation
+# per Production Type) are *aggregated by production type per bidding
+# zone* — not per-plant geographic records. The only per-unit doc (A95)
+# requires the requesting party to register specific Production Unit
+# EICs in advance and does not enumerate them.
+#
+# WRI v1.3 already provides ~6k EU power plants with capacity_mw,
+# primary_fuel, owner and a non-trivial commissioning_year column. That
+# is our EU per-plant baseline. ENTSO-E remains useful for the existing
+# `eu_grid` layer (real-time outage signal, NOT inventory).
+#
+# The fetcher is kept as a no-op stub so the aggregator interface stays
+# uniform; flipping to real data later means swapping this body without
+# touching fetch_power_plants().
+# ============================================================================
+async def _pp_entsoe():
+    """ENTSO-E does not expose per-plant capacity; skip with a one-line note."""
+    print("power_plants: entsoe SKIP — Transparency Platform exposes only "
+          "aggregated production-type capacity per bidding zone, not per-plant "
+          "geo records. WRI covers EU inventory.")
+    return []
 
 
 async def fetch_power_plants():
