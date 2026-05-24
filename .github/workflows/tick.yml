@@ -21,7 +21,7 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 8       # well under the 5-min cron interval after build
+    timeout-minutes: 18       # well under the 5-min cron interval after build
     steps:
       - uses: actions/checkout@v4
 
