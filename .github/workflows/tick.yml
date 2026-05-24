@@ -10,7 +10,7 @@
 name: tick
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # - cron: '*/5 * * * *'
   workflow_dispatch:        # manual "Run workflow" button
 
 # Don't pile up runs if a previous tick is still going.
