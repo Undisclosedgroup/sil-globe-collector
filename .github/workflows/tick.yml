@@ -1,0 +1,70 @@
+# Globe collector tick — runs every 5 min (GH Actions min cron cadence).
+# Each run does one pass of every layer and writes blobs. The collector
+# daemon's per-layer intervals (10s, 15s, etc.) collapse to the cron
+# cadence — high-frequency layers (flights/satellites) become 5-min-cadence
+# here, the trade-off for not needing a persistent host.
+#
+# Free tier note: this repo is PUBLIC so GitHub Actions minutes are free
+# and unlimited.
+
+name: tick
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:        # manual "Run workflow" button
+
+# Don't pile up runs if a previous tick is still going.
+concurrency:
+  group: globe-collector-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8       # well under the 5-min cron interval after build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install system deps for shapely / pyproj / lxml
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libproj-dev proj-data proj-bin \
+            libgeos-dev \
+            libxml2-dev libxslt1-dev
+
+      - name: Install Python deps
+        run: pip install --no-cache-dir -r requirements.txt
+
+      # Restore the kinetic-detector state across runs so each tick warms
+      # the per-cell Z-score baselines instead of cold-starting (the daemon
+      # gets this for free via the ~/Library/Caches/sil-globe pickle).
+      - name: Restore kinetic state
+        uses: actions/cache@v4
+        with:
+          path: kinetic_state.pkl
+          key: kinetic-state-${{ github.run_id }}
+          restore-keys: |
+            kinetic-state-
+
+      - name: Run tick
+        env:
+          PROXYRACK_HOST: ${{ secrets.PROXYRACK_HOST }}
+          PROXYRACK_PORT: ${{ secrets.PROXYRACK_PORT }}
+          PROXYRACK_USERNAME: ${{ secrets.PROXYRACK_USERNAME }}
+          PROXYRACK_PASSWORD: ${{ secrets.PROXYRACK_PASSWORD }}
+          PROXYRACK_PROXY_URL: ${{ secrets.PROXYRACK_PROXY_URL }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GFW_API_KEY: ${{ secrets.GFW_API_KEY }}
+          CLOUDFLARE_RADAR_TOKEN: ${{ secrets.CLOUDFLARE_RADAR_TOKEN }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+          WSDOT_ACCESS_CODE: ${{ secrets.WSDOT_ACCESS_CODE }}
+        run: python -u tick.py
