@@ -10,7 +10,7 @@
 name: tick
 on:
   schedule:
-    # - cron: '*/5 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:        # manual "Run workflow" button
 
 # Don't pile up runs if a previous tick is still going.
@@ -54,6 +54,11 @@ jobs:
 
       - name: Run tick
         env:
+          # Webshare datacenter pool — ProxyRack residential refuses CONNECT
+          # from GH Actions IPs, so the collector's proxy_fetcher swaps to
+          # Webshare when WEBSHARE_POOL_B64 is set. ProxyRack creds stay
+          # in env as harmless fallback for the daemon-mode collector.
+          WEBSHARE_POOL_B64: ${{ secrets.WEBSHARE_POOL_B64 }}
           PROXYRACK_HOST: ${{ secrets.PROXYRACK_HOST }}
           PROXYRACK_PORT: ${{ secrets.PROXYRACK_PORT }}
           PROXYRACK_USERNAME: ${{ secrets.PROXYRACK_USERNAME }}

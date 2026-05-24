@@ -50,6 +50,45 @@ PROXYRACK_USERNAME = os.getenv("PROXYRACK_USERNAME", "")
 PROXYRACK_PASSWORD = os.getenv("PROXYRACK_PASSWORD", "")
 
 
+# ---------------------------------------------------------------------------
+# Webshare datacenter pool — alternate provider for cloud-IP environments
+# (GitHub Actions, Fly.io) where ProxyRack residential refuses CONNECT from
+# AWS/Azure/GH ASNs. When WEBSHARE_POOL_B64 is set, ProxyFetcher's proxy_url
+# returns a random Webshare proxy from the pool *instead of* building a
+# ProxyRack URL. Format of each decoded line: host:port:user:pass (the
+# standard webshare_1000.txt format we already maintain).
+#
+# Trade-off: datacenter IPs are blocked by some anti-bot stacks that allow
+# residential (TikTok, Cloudflare strict, Akamai Bot Manager). Most state
+# DOT / weather / USGS / Overpass endpoints don't care, so this is a good
+# tier for the collector's bulk workload.
+# ---------------------------------------------------------------------------
+_WEBSHARE_POOL: list = []
+_WEBSHARE_POOL_B64 = os.getenv("WEBSHARE_POOL_B64")
+if _WEBSHARE_POOL_B64:
+    try:
+        import base64
+        raw = base64.b64decode(_WEBSHARE_POOL_B64).decode("utf-8", "replace")
+        for ln in raw.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            parts = ln.split(":")
+            if len(parts) >= 4:
+                _WEBSHARE_POOL.append(tuple(parts[:4]))  # (host, port, user, pass)
+        log.info("webshare pool loaded: %d IPs", len(_WEBSHARE_POOL))
+    except Exception as e:
+        log.warning("webshare pool decode failed: %s", e)
+
+
+def _webshare_random_url():
+    """Return a random webshare proxy URL, or None if pool unavailable."""
+    if not _WEBSHARE_POOL:
+        return None
+    h, p, u, w = random.choice(_WEBSHARE_POOL)
+    return f"http://{u}:{w}@{h}:{p}"
+
+
 @dataclasses.dataclass
 class FetchResult:
     status: int
@@ -110,7 +149,12 @@ class ProxyFetcher:
         self.session = session
         self.uptime = uptime
         self.impersonate = impersonate
-        self._configured = bool(PROXYRACK_USERNAME and PROXYRACK_PASSWORD)
+        # "Configured" means we have ANY proxy provider — ProxyRack creds OR
+        # a Webshare pool loaded. Without one of these, refuse fetches (per
+        # CLAUDE.md never-burn-home-IP rule) unless explicitly opted in.
+        self._configured = bool(
+            (PROXYRACK_USERNAME and PROXYRACK_PASSWORD) or _WEBSHARE_POOL
+        )
         if not self._configured and not allow_direct_ip:
             log.error("proxy creds missing — every fetch will be refused")
         # Lazy sessions; cached per (impersonate, proxy_url) tuple.
@@ -119,6 +163,13 @@ class ProxyFetcher:
         self._lock = threading.Lock()
 
     def proxy_url(self) -> Optional[str]:
+        # Webshare pool takes priority when configured (cloud-IP environments
+        # where ProxyRack residential refuses CONNECT). Random per call gives
+        # the same "fresh IP per request" semantic ProxyRack provides via
+        # session-N modifiers.
+        ws = _webshare_random_url()
+        if ws:
+            return ws
         if not self._configured:
             return None
         mods = []
@@ -152,6 +203,15 @@ class ProxyFetcher:
             self._sticky_session_id = (
                 self.session or f"reuse_{random.randint(1, 9_999_999)}"
             )
+        # Webshare path: pick ONE proxy per fetcher lifetime so the cached
+        # curl Session reuses its TCP/TLS handshake. The pool is small (~1k)
+        # but each call goes through the same exit IP for this fetcher,
+        # mirroring the ProxyRack "sticky session" semantic.
+        if _WEBSHARE_POOL:
+            if not hasattr(self, "_sticky_webshare_url"):
+                h, p, u, w = random.choice(_WEBSHARE_POOL)
+                self._sticky_webshare_url = f"http://{u}:{w}@{h}:{p}"
+            return self._sticky_webshare_url
         if not self._configured:
             return None
         mods = []
