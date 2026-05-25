@@ -20,3 +20,6 @@ sgp4>=2.23
 # AI (analytical layers)
 anthropic>=0.18
 openai>=1.30
+
+# Spreadsheets (power_plants EIA-860 reader)
+openpyxl>=3.1
