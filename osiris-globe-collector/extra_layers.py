@@ -1053,14 +1053,13 @@ _PP_LAST_GOOD: dict[str, list] = {}
 
 
 async def _pp_osm() -> list:
-    """Existing OSM bbox-tiled fetcher. Uses the fine-grained hospital boxes
-    instead of OSM_WORLD_BOXES — the latter has 27 boxes averaging 810 deg²
-    each, which Overpass servers throttle aggressively from cloud IPs (we
-    saw OSM counts oscillating 7k-50k tick-to-tick). The hospital boxes are
-    ~1000 boxes averaging 2 deg² each — Overpass returns each in seconds
-    instead of timing out at 30s on the big ones. Concurrency bumped to 6
-    to keep wall time reasonable across the larger box set."""
-    raw = await _overpass_world(POWER_PLANTS_CLAUSE, OSM_HOSPITAL_BOXES, concurrency=6)
+    """Existing OSM bbox-tiled fetcher. Uses OSM_WORLD_BOXES (27 boxes ~810
+    deg² each) at concurrency 4. Reverted the experiment with the 1029-box
+    OSM_HOSPITAL_BOXES at conc 6 — it blew past 700s budget and timed out
+    every tick. With the mirror-rotation + 4-decimal dedup fixes already in,
+    this path returns 7k-50k plants per tick depending on Overpass mood.
+    OSM-only is a *bonus* on top of WRI's reliable 34k + EIA's 16k US set."""
+    raw = await _overpass_world(POWER_PLANTS_CLAUSE, OSM_WORLD_BOXES, concurrency=4)
     return _normalize_power(raw)
 
 
