@@ -640,14 +640,16 @@ def _color_by_fuel(fuel: str) -> str:
 def _pp_dedup_key(lat: float, lng: float, operator: str | None) -> tuple:
     """Key for collapsing duplicate plants across sources.
 
-    ~110m precision via 3-decimal rounding + first-20-char lowercased operator
-    name. Operator is often missing/inconsistent, so when blank we fall back
-    to a geo-only key — that does collapse co-located plants from the same
-    multi-unit campus into one row, which is desired for this layer.
+    4-decimal precision (~11m) + first-20-char lowercased operator name. The
+    earlier 3-decimal (~110m) version was over-aggressive: 100-turbine wind
+    farms collapsed to a single point, and WRI/EIA plants at distinct
+    operators within the same town merged into one another's slot. 4-decimal
+    still catches the cross-source case (the same plant rarely disagrees
+    on coords by more than 11m) without crushing legitimate distinct rows.
     """
     try:
-        lat_r = round(float(lat), 3)
-        lng_r = round(float(lng), 3)
+        lat_r = round(float(lat), 4)
+        lng_r = round(float(lng), 4)
     except (TypeError, ValueError):
         return ("__bad__", lat, lng)
     op = (operator or "").strip().lower()[:20]
@@ -1077,11 +1079,13 @@ def _pp_merge(sources: list[tuple[str, list]]) -> list:
         for it in items:
             k = _pp_dedup_key(it["lat"], it["lng"], it.get("operator"))
             existing = by_key.get(k)
-            if existing is None:
-                # Geo-only fallback key (operator missing/different across sources
-                # is the common case — e.g. WRI 'Pacific Gas & Electric Co' vs
-                # OSM 'PG&E'). Try the lat/lng cell with empty operator before
-                # accepting a new record.
+            if existing is None and it.get("operator"):
+                # Geo-only fallback ONLY when the alt source has a non-empty
+                # operator — that's a real "same plant, different name format"
+                # signal (OSM 'PG&E' vs WRI 'Pacific Gas & Electric Co'). If
+                # the alt source has no operator at all, treat it as a new
+                # plant; collapsing into a geo-cell with no operator was
+                # eating tens of thousands of legitimate distinct rows.
                 geo_k = (k[0], k[1], "")
                 existing = by_key.get(geo_k)
             if existing is None:
