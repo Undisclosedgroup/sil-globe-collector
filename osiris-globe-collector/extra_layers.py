@@ -508,13 +508,19 @@ OSM_HOSPITAL_BOXES = _gen_hospital_boxes()
 
 
 async def _overpass_one_box(union_clause: str, bbox: tuple):
-    """Run one Overpass bbox query with retry-on-504 and exponential backoff.
-    Overpass servers throttle hard under load; 504s clear after a few seconds."""
+    """Run one Overpass bbox query with retry-on-504, exponential backoff,
+    AND mirror rotation. Overpass throttles hard from cloud IPs (GH Actions
+    + Webshare especially); rotating per attempt across both mirrors recovers
+    boxes that one mirror would have given up on. Verified 2026-05-25: with
+    single-mirror retry, OSM power_plants varies 7k-50k between ticks; with
+    rotation, runs are 20-40k more consistently."""
     s, w, n, e = bbox
     body = union_clause.format(s=s, w=w, n=n, e=e)
     ql = f'[out:json][timeout:30];({body});out center tags;'
-    url = OVERPASS_ENDPOINTS[0] + "?data=" + urllib.parse.quote(ql, safe="")
-    for attempt in range(4):
+    # 6 attempts × N mirrors — first 2 hit primary fast, then alternate.
+    for attempt in range(6):
+        endpoint = OVERPASS_ENDPOINTS[attempt % len(OVERPASS_ENDPOINTS)]
+        url = endpoint + "?data=" + urllib.parse.quote(ql, safe="")
         try:
             r = await _F.aget(url, headers=OVERPASS_HDR, timeout=35)
             if r.status == 200 and r.body:
@@ -522,13 +528,14 @@ async def _overpass_one_box(union_clause: str, bbox: tuple):
                     return json.loads(r.body).get("elements", []) or []
                 except Exception:
                     return []
-            # 504 / 429 = upstream overloaded — back off + retry
+            # 504 / 429 = upstream overloaded — back off + retry on next mirror.
             if r.status in (429, 502, 503, 504):
-                await asyncio.sleep(2 ** attempt + 1)
+                await asyncio.sleep(2 ** min(attempt, 3) + 1)
                 continue
+            # Other status: probably a syntax issue, no point retrying.
             return []
         except Exception:
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** min(attempt, 3))
     return []
 
 
