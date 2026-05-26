@@ -2241,8 +2241,18 @@ async def fetch_military_naval():
 # own blob writes (out-of-band from the scheduler's interval fetches).
 # ===========================================================================
 AIS_WS_URL = "wss://stream.aisstream.io/v0/stream"
-BOATS_CAP = 40000              # max vessels held in memory
-BOATS_STALE_S = 60 * 60        # evict positions older than 60 min (was 30)
+# CAP bumped 40k → 100k 2026-05-26: AISStream sees ~50-70k unique vessels
+# per hour globally on terrestrial AIS, plus we're catching short-lived
+# fixes that linger inside the BOATS_STALE_S window. 40k was hitting
+# eviction on every snapshot cycle (visible at https://socialintelligencelabs.com/globe);
+# 100k gives headroom to actually hold what the WebSocket sends instead
+# of evicting freshly-received positions before they ever publish.
+BOATS_CAP = 100000             # max vessels held in memory
+# STALE window stretched 60m → 180m so a vessel pinging once an hour
+# stays on the map across a full multi-tick browsing session. Pier-side
+# tugs / fishing boats often broadcast at 5-10 min intervals only when
+# moving; the longer window keeps them visible while sitting in port.
+BOATS_STALE_S = 180 * 60       # evict positions older than 3h (was 60m)
 BOATS_SNAPSHOT_INTERVAL_S = 30
 
 
