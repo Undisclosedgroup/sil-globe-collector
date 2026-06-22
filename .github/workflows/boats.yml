@@ -30,9 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355   # 5h 55m — under GitHub's 6h job ceiling
     permissions:
-      # repository_dispatch needs write access to chain ourselves.
-      actions: write
-      contents: read
+      # repository_dispatch (POST /dispatches) needs contents:write.
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -56,13 +55,22 @@ jobs:
         run: python -u boats_daemon.py
 
       - name: Chain next run
-        # Even if the daemon exits non-zero (rare), still chain — better
-        # one gap than indefinite downtime. always() runs on any outcome.
+        # Self-chain so the next 5h50m job starts within ~30s (vs the 6h
+        # schedule gap). NOTE: GitHub's GITHUB_TOKEN cannot trigger a new
+        # workflow run via repository_dispatch (recursion guard) — so real
+        # self-chaining needs a PAT. Add a `BOATS_CHAIN_PAT` secret (repo:write)
+        # to enable it; without it this is a no-op and the 6h `schedule`
+        # trigger restarts boats (≤~10min gap). Non-fatal either way so the
+        # run never shows red on a dispatch hiccup.
         if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.BOATS_CHAIN_PAT || github.token }}
           REPO: ${{ github.repository }}
         run: |
-          gh api -X POST "repos/$REPO/dispatches" \
-            -f event_type=boats-chain \
-            && echo "  chained next boats run via repository_dispatch"
+          if [ -n "${{ secrets.BOATS_CHAIN_PAT }}" ]; then
+            gh api -X POST "repos/$REPO/dispatches" -f event_type=boats-chain \
+              && echo "chained next boats run via repository_dispatch" \
+              || echo "chain dispatch failed; relying on the 6h schedule"
+          else
+            echo "no BOATS_CHAIN_PAT secret — self-chaining disabled; 6h schedule restarts boats"
+          fi
