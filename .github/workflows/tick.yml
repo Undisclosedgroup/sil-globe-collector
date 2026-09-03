@@ -1,17 +1,20 @@
-# Globe collector tick — runs every 5 min (GH Actions min cron cadence).
-# Each run does one pass of every layer and writes blobs. The collector
-# daemon's per-layer intervals (10s, 15s, etc.) collapse to the cron
-# cadence — high-frequency layers (flights/satellites) become 5-min-cadence
-# here, the trade-off for not needing a persistent host.
+# Globe collector tick — DISABLED 2026-09-03. This job has been running
+# redundantly in parallel with sil-globe-collector.service on Phoenix
+# (216.152.151.3) since that systemd deployment went live ~2026-07-31 (see
+# github.com/undisclozed/sil-globe-collector's DEPLOY.md) — nobody turned
+# this schedule off after the migration, so it kept costing real Actions
+# minutes (~$193/mo net across two billing periods, plus this job was
+# failing on every recent run from proxy access breaking on GH's ephemeral
+# runner IPs) for no benefit; the real collector on Phoenix has been the
+# one actually feeding the dashboard this whole time. Kept as
+# workflow_dispatch-only for manual reruns / as a documented rollback path.
 #
 # Free tier note: this repo is PUBLIC so GitHub Actions minutes are free
-# and unlimited.
+# and unlimited — even so, this run cost real money; see the note above.
 
 name: tick
 on:
-  schedule:
-    - cron: '15,45 * * * *'
-  workflow_dispatch:        # manual "Run workflow" button
+  workflow_dispatch:        # manual "Run workflow" button — schedule removed, see note above
 
 # Don't pile up runs if a previous tick is still going.
 concurrency:
