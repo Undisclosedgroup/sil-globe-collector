@@ -1,23 +1,21 @@
-# Boats AISStream daemon — long-running WebSocket listener.
+# Boats AISStream daemon — DISABLED 2026-09-03. Migrated to
+# sil-globe-boats.service on Phoenix (216.152.151.3), running under
+# systemd Restart=always alongside sil-globe-collector.service (which has
+# been running there since ~2026-07-31 — see undisclozed/sil-globe-collector's
+# DEPLOY.md). Verified live: globe/boats.json got a fresh Vercel Blob write
+# ~30s after the systemd service started. Kept as workflow_dispatch-only
+# for manual reruns / rollback.
 #
 # AISStream's only access pattern is a persistent WebSocket; there's no REST
 # snapshot. Each job here connects to the WS, accumulates per-MMSI vessel
-# state, and writes `globe/boats.json` to Vercel Blob every 30s. After
-# 5h 50m the boats_daemon's watchdog cancels cleanly, the workflow ends,
-# and the bottom of this file chains the next run via repository_dispatch.
+# state, and writes `globe/boats.json` to Vercel Blob every 30s.
 #
-# Net effect: ~continuous coverage with ~10-min gaps between job handoffs
-# (vs needing a $5/mo Fly.io VM). Public repo => free unlimited minutes.
+# Public repo => free unlimited minutes, in theory — see the recent billing
+# audit for why that didn't hold in practice.
 
 name: boats
 on:
-  schedule:
-    # Backup trigger every 6h in case the chain breaks (e.g. runner killed
-    # before posting the dispatch). Worst case gap ~6h.
-    - cron: '0 */6 * * *'
   workflow_dispatch:
-  repository_dispatch:
-    types: [boats-chain]
 
 concurrency:
   # Never run two boats daemons simultaneously — they'd both write the
